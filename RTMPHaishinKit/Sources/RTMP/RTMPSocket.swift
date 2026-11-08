@@ -10,6 +10,7 @@ final actor RTMPSocket {
         case endOfStream
         case connectionTimedOut
         case connectionNotEstablished(_ error: NWError?)
+        case outputOverflow
     }
 
     private var timeout: UInt64 = 15
@@ -27,16 +28,18 @@ final actor RTMPSocket {
             oldValue?.forceCancel()
         }
     }
-    private var outputs: AsyncStream<Data>.Continuation? {
-        didSet {
-            oldValue?.finish()
-        }
-    }
     private var qualityOfService: DispatchQoS = .userInitiated
     private var continuation: CheckedContinuation<Void, any Swift.Error>?
+    private var sendContentOverride: (@Sendable (Data) async throws -> Void)?
     private lazy var networkQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.RTMPSocket.network", qos: qualityOfService)
 
     init() {
+    }
+
+    /// Internal network boundary for deterministic delayed-completion tests.
+    init(sendContent: @escaping @Sendable (Data) async throws -> Void) {
+        self.sendContentOverride = sendContent
+        connected = true
     }
 
     init(qualityOfService: DispatchQoS, securityLevel: StreamSocketSecurityLevel) {
@@ -83,31 +86,26 @@ final actor RTMPSocket {
         }
     }
 
-    func send(_ data: Data) {
-        guard connected else {
-            return
-        }
-        queueBytesOut += data.count
-        outputs?.yield(data)
-    }
+    private static let maximumPendingBytes = 4 * 1024 * 1024
 
-    func send(_ iterator: AnyIterator<Data>) {
-        guard connected else {
-            return
-        }
-        for data in iterator {
-            queueBytesOut += data.count
-            outputs?.yield(data)
-        }
-    }
-
-    func send(_ chunks: [Data]) {
-        guard connected else {
-            return
-        }
+    /// Handshake and the one connection pump both await this same completion
+    /// path. There is no second AsyncStream consumer that can reorder C2 and the
+    /// connect command. Each chunk is processed before the next is submitted.
+    func sendAcknowledged(_ chunks: [Data]) async throws {
         for data in chunks {
+            guard connected else { throw Error.invalidState }
+            guard data.count <= Self.maximumPendingBytes - queueBytesOut else {
+                close(); throw Error.outputOverflow
+            }
             queueBytesOut += data.count
-            outputs?.yield(data)
+            do {
+                try await send(data)
+                totalBytesOut += data.count
+                queueBytesOut -= data.count
+            } catch {
+                queueBytesOut -= data.count
+                throw error
+            }
         }
     }
 
@@ -136,7 +134,6 @@ final actor RTMPSocket {
             self.continuation = nil
         }
         connected = false
-        outputs = nil
         connection = nil
         continuation = nil
     }
@@ -146,15 +143,6 @@ final actor RTMPSocket {
         case .ready:
             logger.info("Connection is ready.")
             connected = true
-            let (stream, continuation) = AsyncStream<Data>.makeStream()
-            Task {
-                for await data in stream where connected {
-                    try await send(data)
-                    totalBytesOut += data.count
-                    queueBytesOut -= data.count
-                }
-            }
-            self.outputs = continuation
             self.continuation?.resume()
             self.continuation = nil
         case .waiting(let error):
@@ -183,6 +171,7 @@ final actor RTMPSocket {
     }
 
     private func send(_ data: Data) async throws {
+        if let sendContentOverride { try await sendContentOverride(data); return }
         return try await withCheckedThrowingContinuation { continuation in
             guard let connection else {
                 continuation.resume(throwing: Error.invalidState)

@@ -220,6 +220,7 @@ public actor RTMPStream {
     private var dataTimestamps: [String: Date] = .init()
     private var audioTimestamp: RTMPTimestamp<AVAudioTime> = .init()
     private var videoTimestamp: RTMPTimestamp<CMTime> = .init()
+    private var compressedTimestamp: RTMPSharedTimestamp?
     private var requestTimeout = RTMPConnection.defaultRequestTimeout
     private var expectedResponse: Code?
     package var bitRateStrategy: (any StreamBitRateStrategy)?
@@ -302,6 +303,7 @@ public actor RTMPStream {
             videoFormat = nil
             audioTimestamp.clear()
             videoTimestamp.clear()
+            compressedTimestamp = nil
             let response = try await withCheckedThrowingContinuation { continuation in
                 readyState = .play
                 expectedResponse = Code.playStart
@@ -365,6 +367,7 @@ public actor RTMPStream {
             videoFormat = nil
             audioTimestamp.clear()
             videoTimestamp.clear()
+            compressedTimestamp = nil
             let response = try await withCheckedThrowingContinuation { continuation in
                 readyState = .publish
                 expectedResponse = Code.publishStart
@@ -550,10 +553,8 @@ public actor RTMPStream {
     }
 
     func doOutput(_ type: RTMPChunkType, chunkStreamId: RTMPChunkStreamId, message: some RTMPMessage) {
-        Task {
-            let length = await connection?.doOutput(type, chunkStreamId: chunkStreamId, message: message) ?? 0
-            info.byteCount += length
-        }
+        let length = connection?.enqueueOutput(type, chunkStreamId: chunkStreamId, message: message) ?? 0
+        info.byteCount += length
     }
 
     func dispatch(_ message: some RTMPMessage, type: RTMPChunkType) {
@@ -725,6 +726,53 @@ extension RTMPStream: _Stream {
             throw Error.unsupportedCodec
         }
         outgoing.videoSettings = videoSettings
+    }
+
+    /// Sets one timestamp epoch for acknowledged compressed media after publish
+    /// succeeds and before its first packet. Use a new publish for reconnect;
+    /// changing an active epoch would corrupt relative RTMP chunk timestamps.
+    public func setCompressedTimestampOrigin(_ origin: CMTime) throws {
+        guard readyState == .publishing, compressedTimestamp == nil,
+              audioFormat == nil, videoFormat == nil else { throw Error.invalidState }
+        compressedTimestamp = try RTMPSharedTimestamp(origin: origin)
+    }
+
+    /// Sends already-encoded H.264 and awaits Network.framework processing of
+    /// the complete codec header/payload sequence. This is not receiver delivery.
+    /// Call from one bounded app pump; cancellation closes this connection.
+    public func sendCompressedVideo(_ sampleBuffer: CMSampleBuffer) async throws {
+        guard readyState == .publishing,
+              sampleBuffer.formatDescription?.isCompressed == true,
+              sampleBuffer.formatDescription?.mediaType == .video,
+              let connection else { throw Error.invalidState }
+        let time = sampleBuffer.decodeTimeStamp.isValid ? sampleBuffer.decodeTimeStamp : sampleBuffer.presentationTimeStamp
+        guard var timestamp = compressedTimestamp else { throw Error.invalidState }
+        let delta = try timestamp.update(time, video: true)
+        compressedTimestamp = timestamp
+        videoFormat = sampleBuffer.formatDescription // header enters same FIFO first
+        guard let message = RTMPVideoMessage(streamId: id, timestamp: delta, sampleBuffer: sampleBuffer) else {
+            throw Error.unsupportedCodec
+        }
+        try await connection.sendAcknowledged(.one, chunkStreamId: .video, message: message)
+        frameCount += 1
+        info.byteCount += message.payload.count
+    }
+
+    /// AAC counterpart of sendCompressedVideo, preserving its offset from the
+    /// explicit common origin. Packets before that origin must be omitted by the
+    /// caller when beginning a new random-access transport generation.
+    public func sendCompressedAudio(_ audioBuffer: AVAudioCompressedBuffer, when: AVAudioTime) async throws {
+        guard readyState == .publishing, let connection else { throw Error.invalidState }
+        guard when.isHostTimeValid, var timestamp = compressedTimestamp else { throw Error.invalidState }
+        let time = CMTime(seconds: AVAudioTime.seconds(forHostTime: when.hostTime), preferredTimescale: 1_000_000_000)
+        let delta = try timestamp.update(time, video: false)
+        compressedTimestamp = timestamp
+        audioFormat = audioBuffer.format
+        guard let message = RTMPAudioMessage(streamId: id, timestamp: delta, audioBuffer: audioBuffer) else {
+            throw Error.unsupportedCodec
+        }
+        try await connection.sendAcknowledged(.one, chunkStreamId: .audio, message: message)
+        info.byteCount += message.payload.count
     }
 
     public func append(_ sampleBuffer: CMSampleBuffer) {

@@ -196,6 +196,10 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
     }
 
     private var socket: RTMPSocket?
+    private var outputAborting = false
+    private var isClosing = false
+    /// Shared by all streams. Synchronous admission precedes any retained Task.
+    private nonisolated let outputQueue: RTMPOutputQueue
     private var chunks: [UInt16: RTMPChunkMessageHeader] = [:]
     private var streams: [RTMPStream] = []
     private var sequence: Int64 = 0
@@ -265,7 +269,9 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         timeout: Int = RTMPConnection.defaultTimeout,
         requestTimeout: UInt64 = RTMPConnection.defaultRequestTimeout,
         chunkSize: Int = RTMPConnection.defaultChunkSizeS,
-        qualityOfService: DispatchQoS = .userInitiated) {
+        qualityOfService: DispatchQoS = .userInitiated,
+        maximumPendingOutputBytes: Int = 4 * 1024 * 1024,
+        maximumPendingOutputMessages: Int = 128) {
         self.swfUrl = swfUrl
         self.pageUrl = pageUrl
         self.flashVer = flashVer
@@ -277,9 +283,29 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         self.requestTimeout = requestTimeout
         self.chunkSize = chunkSize
         self.qualityOfService = qualityOfService
+        let outputQueue = RTMPOutputQueue(byteLimit: maximumPendingOutputBytes,
+            messageLimit: maximumPendingOutputMessages, chunkSize: max(1, chunkSize))
+        self.outputQueue = outputQueue
+        // Two tasks per connection, independent of media callback rate.
+        Task { [weak self, outputQueue] in
+            for await _ in outputQueue.wakeups {
+                while let lease = outputQueue.take() {
+                    guard let self else { outputQueue.close(.closed); return }
+                    do { try await self.sendOutput(lease); outputQueue.acknowledge(lease) }
+                    catch { outputQueue.close(.sendFailed); outputQueue.acknowledge(lease) }
+                }
+            }
+        }
+        Task { [weak self, outputQueue] in
+            for await generation in outputQueue.failures {
+                guard let self else { return }
+                await self.outputFailed(generation: generation)
+            }
+        }
     }
 
     deinit {
+        outputQueue.shutdown()
         streams.removeAll()
     }
 
@@ -311,7 +337,7 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
 
     /// Creates a two-way connection to an application on RTMP Server.
     public func connect(_ command: String, arguments: (any Sendable)?...) async throws -> RTMPResponse {
-        guard !connected else {
+        guard !connected, !isClosing, !outputAborting else {
             throw Error.invalidState
         }
         guard let uri = URL(string: command), let scheme = uri.scheme, let host = uri.host, !host.isEmpty, Self.supportedProtocols.contains(scheme) else {
@@ -320,6 +346,7 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         self.uri = uri
         self.arguments = arguments
         let secure = uri.scheme == "rtmps" || uri.scheme == "rtmpts"
+        try outputQueue.reset()
         handshake.clear()
         chunks.removeAll()
         sequence = 0
@@ -343,8 +370,8 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                     }
                     do {
                         readyState = .versionSent
-                        await socket.send(handshake.c0c1packet)
                         operations[Self.connectTransactionId] = continutation
+                        try await socket.sendAcknowledged([handshake.c0c1packet])
                         for await data in await socket.recv() {
                             try await listen(data)
                         }
@@ -401,18 +428,32 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
 
     /// Closes the connection from the server.
     public func close() async throws {
+        guard !isClosing else { return }
         guard readyState != .uninitialized else {
             throw Error.invalidState
         }
 
-        uri = nil
+        await finishClose { await self.closeStreams() }
+    }
+
+    private func closeStreams() async {
         for stream in streams {
-            if await stream.fcPublishName == nil {
-                _ = try? await stream.close()
-            } else {
-                await stream.deleteStream()
-            }
+            if await stream.fcPublishName == nil { _ = try? await stream.close() }
+            else { await stream.deleteStream() }
         }
+    }
+
+    /// The actual close critical section. The cleanup boundary makes asynchronous
+    /// stream-close ordering testable without opening a socket. connect() must
+    /// reject reentry until this entire operation, including socket/state cleanup,
+    /// has finished.
+    func finishClose(cleanupStreams: @Sendable () async -> Void) async {
+        guard !isClosing else { return }
+        isClosing = true
+        defer { isClosing = false }
+        uri = nil
+        await cleanupStreams()
+        outputQueue.close(.closed)
         await socket?.close()
         await networkMonitor?.stopRunning()
 
@@ -432,14 +473,45 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
 
     @discardableResult
     func doOutput(_ type: RTMPChunkType, chunkStreamId: RTMPChunkStreamId, message: some RTMPMessage) -> Int {
-        if logger.isEnabledFor(level: .trace) {
-            logger.trace("<<", message)
+        enqueueOutput(type, chunkStreamId: chunkStreamId, message: message)
+    }
+
+    /// Nonisolated, lock-admitted entry: RTMPStream need not create a Task just
+    /// to hand over each payload. Queue capacity is reserved before retention.
+    @discardableResult
+    nonisolated func enqueueOutput(_ type: RTMPChunkType, chunkStreamId: RTMPChunkStreamId,
+                                  message: some RTMPMessage) -> Int {
+        outputQueue.offer(type, chunkStreamId: chunkStreamId, message: message)
+    }
+
+    func sendAcknowledged(_ type: RTMPChunkType, chunkStreamId: RTMPChunkStreamId,
+                          message: some RTMPMessage) async throws {
+        try await outputQueue.send(type, chunkStreamId: chunkStreamId, message: message)
+    }
+
+    private func sendOutput(_ lease: RTMPOutputQueue.Lease) async throws {
+        guard lease.generation == outputQueue.metrics.generation,
+              readyState == .handshakeDone, let socket else {
+            throw RTMPOutputQueue.Failure.closed
         }
-        let chunks = Array(outputBuffer.putMessage(type, chunkStreamId: chunkStreamId.rawValue, message: message))
-        Task {
-            await socket?.send(chunks)
-        }
-        return message.payload.count
+        let chunks = Array(outputBuffer.putMessage(lease.chunkType,
+            chunkStreamId: lease.chunkStreamId.rawValue, message: lease.message))
+        try await socket.sendAcknowledged(chunks)
+    }
+
+    private func outputFailed(generation: UInt64) async {
+        let metrics = outputQueue.metrics
+        guard generation == metrics.generation, metrics.failed,
+              metrics.failure != .closed, !outputAborting else { return }
+        outputAborting = true
+        defer { outputAborting = false }
+        // Abort the socket first; graceful NetStream acknowledgment cannot arrive
+        // on a stalled transport. close() then reconciles stream/public state.
+        let failedSocket = socket
+        await failedSocket?.close()
+        guard generation == outputQueue.metrics.generation else { return }
+        connected = false
+        try? await close()
     }
 
     func addStream(_ stream: RTMPStream) {
@@ -453,7 +525,8 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
             guard handshake.hasS0S1Packet else {
                 return
             }
-            await socket?.send(handshake.c2packet())
+            guard let socket else { throw Error.invalidState }
+            try await socket.sendAcknowledged([handshake.c2packet()])
             readyState = .ackSent
             try await listen(.init())
         case .ackSent:
