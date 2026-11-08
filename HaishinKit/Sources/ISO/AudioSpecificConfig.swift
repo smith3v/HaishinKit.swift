@@ -244,7 +244,7 @@ package struct AudioSpecificConfig: Equatable {
     package init?(formatDescription: CMFormatDescription?) {
         guard
             let streamDescription = formatDescription?.audioStreamBasicDescription,
-            let type = AudioObjectType(objectID: MPEG4ObjectID(rawValue: Int(streamDescription.mFormatFlags))),
+            let type = Self.audioObjectType(streamDescription),
             let frequency = SamplingFrequency(sampleRate: streamDescription.mSampleRate),
             let channelConfig = ChannelConfiguration(channelCount: streamDescription.mChannelsPerFrame) else {
             return nil
@@ -252,6 +252,16 @@ package struct AudioSpecificConfig: Equatable {
         self.type = type
         self.frequency = frequency
         self.channelConfig = channelConfig
+    }
+
+    private static func audioObjectType(_ description: AudioStreamBasicDescription) -> AudioObjectType? {
+        // Apple's CoreAudioBaseTypes.h defines this format ID as Low Complexity
+        // AAC with no flags. AVAudioConverter emits that canonical flags == 0
+        // ASBD; legacy HaishinKit descriptions put MPEG4ObjectID in the flags.
+        if description.mFormatID == kAudioFormatMPEG4AAC, description.mFormatFlags == 0 {
+            return .aacLc
+        }
+        return AudioObjectType(objectID: MPEG4ObjectID(rawValue: Int(description.mFormatFlags)))
     }
 
     func encode(to data: inout Data, length: Int) {
