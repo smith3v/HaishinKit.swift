@@ -750,7 +750,10 @@ extension RTMPStream: _Stream {
         let delta = try timestamp.update(time, video: true)
         compressedTimestamp = timestamp
         videoFormat = sampleBuffer.formatDescription // header enters same FIFO first
-        guard let message = RTMPVideoMessage(streamId: id, timestamp: delta, sampleBuffer: sampleBuffer) else {
+        // Explicit compressed input already supplies its DTS/PTS relationship.
+        // Do not add the legacy raw-encoder latency compensation to this clock.
+        guard let message = RTMPVideoMessage(streamId: id, timestamp: delta,
+            sampleBuffer: sampleBuffer, compositionTimeOffset: 0) else {
             throw Error.unsupportedCodec
         }
         try await connection.sendAcknowledged(.one, chunkStreamId: .video, message: message)
